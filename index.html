@@ -187,16 +187,14 @@
       </div>
       <div class="opt-group">
         <h3>Erinnerung – Rufdienste (D1/D2)</h3>
-        <label><input type="checkbox" id="optReminderOncallEnabled" checked> Am Vorabend um
-          <input type="time" id="optReminderOncallTime" value="20:00" style="font-family:var(--mono);padding:3px 5px;border:1px solid var(--line);border-radius:2px;">
-        </label>
+        <label><input type="checkbox" id="optReminderOncallEnabled" checked> 24 Std. vorher</label>
       </div>
       <div class="opt-group">
         <h3>Titel-Präfix (optional)</h3>
         <input type="text" id="optPrefix" placeholder="z. B. NRad –" style="font-family:var(--mono);padding:5px 7px;border:1px solid var(--line);border-radius:2px;width:180px;">
       </div>
     </div>
-    <p style="font-size:12px;color:#5a5347;margin:10px 0 0;">Urlaub (U) und Tage ohne Arbeitsplatz ("allg") werden automatisch nie als Termin angelegt. Rufdienste erhalten standardmäßig eine Erinnerung am Vorabend (unabhängig davon, wann der Dienst selbst beginnt) – Arbeitsplatz-Termine standardmäßig keine.</p>
+    <p style="font-size:12px;color:#5a5347;margin:10px 0 0;">Urlaub (U) und Tage ohne Arbeitsplatz ("allg") werden automatisch nie als Termin angelegt. Rufdienste erhalten standardmäßig eine Erinnerung 24 Std. vorher (unabhängig davon, wann der Dienst selbst beginnt) – Arbeitsplatz-Termine standardmäßig keine.</p>
   </section>
 
   <section id="previewSection" class="hidden">
@@ -221,7 +219,10 @@
 
 <div class="download-bar" id="downloadBar" style="display:none;">
   <div class="summary" id="downloadSummary"></div>
-  <button class="btn" id="downloadBtn">.ics herunterladen</button>
+  <div>
+    <button class="btn" id="downloadBtn">.ics herunterladen</button>
+    <button class="btn secondary" id="shareBtn" style="margin-left:8px;">Teilen</button>
+  </div>
 </div>
 
 <script>
@@ -289,17 +290,27 @@ async function parsePdf(file){
   for(let p = 1; p <= pdf.numPages; p++){
     const page = await pdf.getPage(p);
     const content = await page.getTextContent();
-    // group items by rounded y position to reconstruct rows
-    const groups = {};
+
+    // Nachbarschafts-Clusterung statt starrer Rundung: jedes Textfragment wird der
+    // nächstgelegenen bestehenden Zeile zugeordnet (Toleranz statt fester Bucket-Grenze).
+    // Das ist robuster gegen kleine Y-Abweichungen zwischen unterschiedlichen PDF-Exporten,
+    // die bei fester Rundung eine Tabellenzeile fälschlich in zwei Buckets aufspalten konnten.
+    const TOL = 3; // Punkt Toleranz - deutlich kleiner als der Zeilenabstand der Tabelle
+    const rows = [];
     for(const item of content.items){
-      const y = Math.round(item.transform[5] / 2) * 2; // tolerance bucket
-      if(!groups[y]) groups[y] = [];
-      groups[y].push(item);
+      const y = item.transform[5];
+      let row = rows.find(r => Math.abs(r.y - y) <= TOL);
+      if(!row){
+        row = {y, items: []};
+        rows.push(row);
+      }
+      row.items.push(item);
+      row.y = (row.y * (row.items.length - 1) + y) / row.items.length; // gleitender Mittelwert
     }
-    const ys = Object.keys(groups).map(Number).sort((a,b) => b - a); // top to bottom
-    for(const y of ys){
-      const rowItems = groups[y].sort((a,b) => a.transform[4] - b.transform[4]);
-      const line = rowItems.map(i => i.str).join(' ').replace(/\s+/g,' ').trim();
+    rows.sort((a,b) => b.y - a.y); // oben nach unten
+    for(const row of rows){
+      row.items.sort((a,b) => a.transform[4] - b.transform[4]); // links nach rechts
+      const line = row.items.map(i => i.str).join(' ').replace(/\s+/g,' ').trim();
       if(line) lines.push(line);
     }
   }
@@ -350,9 +361,39 @@ function computeEvents(rows){
   const events = [];
   const sorted = [...rows].sort((a,b) => dateSortKey(a.date) - dateSortKey(b.date));
 
+  // Aufeinanderfolgende "U"-Tage (Urlaub) zu einem einzigen ganztägigen Termin
+  // zusammenfassen (z.B. Mo+Di Urlaub -> EIN Termin Mo 00:00 - Mi 00:00).
+  let urlaubStart = null, urlaubEnd = null;
+  function flushUrlaub(){
+    if(urlaubStart){
+      events.push({
+        id: `urlaub-${urlaubStart}`,
+        kind: 'urlaub',
+        code: 'U',
+        startDate: urlaubStart,
+        endDate: urlaubEnd // letzter Urlaubstag (inklusive)
+      });
+    }
+    urlaubStart = null; urlaubEnd = null;
+  }
+
   for(const r of sorted){
+    if(r.abk === 'U'){
+      if(urlaubEnd){
+        const {y,m,d} = parseDate(urlaubEnd);
+        const next = addDays(y,m,d,1);
+        const isConsecutive = fmtDate(next.y,next.m,next.d) === r.date;
+        if(isConsecutive){ urlaubEnd = r.date; }
+        else { flushUrlaub(); urlaubStart = r.date; urlaubEnd = r.date; }
+      } else {
+        urlaubStart = r.date; urlaubEnd = r.date;
+      }
+      continue; // U-Tage erzeugen nie einen Arbeitsplatz-Termin
+    }
+    flushUrlaub(); // Streak endet, sobald ein Nicht-U-Tag kommt
+
     // Arbeitsplatz-Termin
-    if(r.abk !== 'U' && r.arbeitsplatz && r.arbeitsplatz.trim().toLowerCase() !== 'allg'){
+    if(r.arbeitsplatz && r.arbeitsplatz.trim().toLowerCase() !== 'allg'){
       events.push({
         id: `arbeit-${r.date}`,
         kind: 'arbeit',
@@ -388,6 +429,8 @@ function computeEvents(rows){
       });
     }
   }
+  flushUrlaub(); // letzten offenen Streak am Ende der Liste abschließen
+
   return events;
 }
 
@@ -419,12 +462,11 @@ function currentOptions(){
   return {
     reminderArbeit: parseInt(document.getElementById('optReminderArbeit').value, 10),
     oncallReminderEnabled: document.getElementById('optReminderOncallEnabled').checked,
-    oncallReminderTime: document.getElementById('optReminderOncallTime').value || '20:00',
     prefix: document.getElementById('optPrefix').value.trim()
   };
 }
 
-['optReminderArbeit','optReminderOncallEnabled','optReminderOncallTime','optPrefix'].forEach(id => {
+['optReminderArbeit','optReminderOncallEnabled','optPrefix'].forEach(id => {
   document.getElementById(id).addEventListener('input', renderPreview);
 });
 
@@ -435,16 +477,24 @@ function renderPreview(){
 
   for(const ev of computedEvents){
     const tr = document.createElement('tr');
-    tr.className = ev.kind === 'oncall' ? 'urlaub' : 'arbeit'; // reuse Farbakzent-Klassen
-    const title = (ev.kind === 'arbeit')
-      ? (legendLabels[ev.code] || ev.code)
-      : ev.code + (heliosSet.has(ev.id) ? ' + Helios' : '');
-    const von = ev.startDate === ev.endDate ? `${ev.startDate} ${ev.startTime}` : `${ev.startDate} ${ev.startTime}`;
-    const bis = `${ev.endDate} ${ev.endTime}`;
-    const heliosCell = ev.kind === 'oncall'
-      ? `<label style="display:flex;align-items:center;gap:5px;cursor:pointer;"><input type="checkbox" data-helios-id="${escapeHtml(ev.id)}" ${heliosSet.has(ev.id) ? 'checked' : ''}> + Helios</label>`
-      : '';
-    tr.innerHTML = `<td class="tag-${ev.kind === 'oncall' ? 'urlaub' : 'arbeit'}">●</td>
+    const cssClass = ev.kind === 'oncall' ? 'urlaub' : (ev.kind === 'urlaub' ? 'frei' : 'arbeit');
+    tr.className = cssClass; // reuse vorhandene Farbakzent-Klassen
+    let title, von, bis, heliosCell = '';
+    if(ev.kind === 'arbeit'){
+      title = legendLabels[ev.code] || ev.code;
+      von = `${ev.startDate} ${ev.startTime}`;
+      bis = `${ev.endDate} ${ev.endTime}`;
+    } else if(ev.kind === 'urlaub'){
+      title = 'U';
+      von = ev.startDate === ev.endDate ? ev.startDate : `${ev.startDate} – ${ev.endDate}`;
+      bis = '(ganztägig)';
+    } else {
+      title = ev.code + (heliosSet.has(ev.id) ? ' + Helios' : '');
+      von = `${ev.startDate} ${ev.startTime}`;
+      bis = `${ev.endDate} ${ev.endTime}`;
+      heliosCell = `<label style="display:flex;align-items:center;gap:5px;cursor:pointer;"><input type="checkbox" data-helios-id="${escapeHtml(ev.id)}" ${heliosSet.has(ev.id) ? 'checked' : ''}> + Helios</label>`;
+    }
+    tr.innerHTML = `<td class="tag-${cssClass}">●</td>
       <td>${von}</td><td>${bis}</td>
       <td class="abk">${escapeHtml(title)}</td>
       <td>${heliosCell}</td>`;
@@ -462,8 +512,9 @@ function renderPreview(){
   document.getElementById('previewSection').classList.remove('hidden');
   const workCount = computedEvents.filter(e => e.kind === 'arbeit').length;
   const oncallCount = computedEvents.filter(e => e.kind === 'oncall').length;
+  const urlaubCount = computedEvents.filter(e => e.kind === 'urlaub').length;
   document.getElementById('summaryText').innerHTML =
-    `<span class="stat">${workCount}</span> Arbeitsplatz-Termine, <span class="stat">${oncallCount}</span> Rufdienste` +
+    `<span class="stat">${workCount}</span> Arbeitsplatz-Termine, <span class="stat">${oncallCount}</span> Rufdienste, <span class="stat">${urlaubCount}</span> Urlaubs-Zeiträume` +
     (parsedRows.length ? ` (Zeitraum ${parsedRows[0].date} – ${parsedRows[parsedRows.length-1].date}).` : '.');
 
   const bar = document.getElementById('downloadBar');
@@ -475,17 +526,32 @@ function renderPreview(){
   }
 }
 
-document.getElementById('downloadBtn').addEventListener('click', async () => {
+function generateIcsBlob(){
   const opts = currentOptions();
   const ics = buildIcs(computedEvents, opts, legendLabels, heliosSet);
   const first = parsedRows[0].date.replace(/\./g,'-');
   const last = parsedRows[parsedRows.length-1].date.replace(/\./g,'-');
   const filename = `dienstplan_${first}_bis_${last}.ics`;
   const blob = new Blob([ics], {type: 'text/calendar;charset=utf-8'});
+  return {blob, filename};
+}
 
-  // 1. Versuch: Web Share API. Auf iOS/Android öffnet das den nativen Teilen-Dialog,
-  // von dem aus die .ics direkt in die Kalender-App oder "Dateien" gespeichert werden
-  // kann - das ist der zuverlässigste Weg auf dem Smartphone.
+// Klassischer Download - funktioniert auf Desktop-Browsern zuverlässig.
+document.getElementById('downloadBtn').addEventListener('click', () => {
+  const {blob, filename} = generateIcsBlob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+
+// Teilen - v.a. für Mobilgeräte, öffnet den nativen Teilen-Dialog (z.B. direkt zu "Kalender"/"Dateien").
+document.getElementById('shareBtn').addEventListener('click', async () => {
+  const {blob, filename} = generateIcsBlob();
   try{
     const file = new File([blob], filename, {type: 'text/calendar'});
     if(navigator.canShare && navigator.canShare({files: [file]})){
@@ -493,12 +559,9 @@ document.getElementById('downloadBtn').addEventListener('click', async () => {
       return;
     }
   }catch(err){
-    if(err && err.name === 'AbortError') return; // Nutzer hat den Dialog abgebrochen
-    // sonst: weiter zum Fallback unten
+    if(err && err.name === 'AbortError') return;
   }
-
-  // 2. Fallback: sichtbarer Link statt unsichtbarem Auto-Klick. Manche mobilen
-  // Browser (v.a. iOS Safari) ignorieren programmatische Klicks auf <a download>.
+  // Fallback, falls Web Share nicht verfügbar ist: sichtbarer Link zum Antippen.
   const url = URL.createObjectURL(blob);
   showManualDownloadLink(url, filename);
 });
@@ -509,8 +572,8 @@ function showManualDownloadLink(url, filename){
     link = document.createElement('a');
     link.id = 'manualDownloadLink';
     link.className = 'btn secondary';
-    link.style.marginLeft = '10px';
-    document.getElementById('downloadBar').appendChild(link);
+    link.style.marginLeft = '8px';
+    document.getElementById('shareBtn').insertAdjacentElement('afterend', link);
   }
   link.href = url;
   link.download = filename;
@@ -552,28 +615,6 @@ function addDays(y,m,d,n){
   return {y: dt.getUTCFullYear(), m: dt.getUTCMonth()+1, d: dt.getUTCDate()};
 }
 
-// Grobe, für Erinnerungszwecke ausreichend genaue Bestimmung, ob ein Datum in der
-// mitteleuropäischen Sommerzeit (CEST, UTC+2) liegt, sonst CET (UTC+1).
-// EU-Regel: Sommerzeit von letztem Sonntag im März 01:00 UTC bis letztem Sonntag im Oktober 01:00 UTC.
-function lastSundayOfMonth(year, month){ // month 1-12
-  const d = new Date(Date.UTC(year, month, 0)); // letzter Tag des Monats
-  return d.getUTCDate() - d.getUTCDay();
-}
-function berlinOffsetHours(y,m,d){
-  const marLastSun = lastSundayOfMonth(y,3);
-  const octLastSun = lastSundayOfMonth(y,10);
-  const start = Date.UTC(y,2,marLastSun,1,0,0);
-  const end = Date.UTC(y,9,octLastSun,1,0,0);
-  const t = Date.UTC(y,m-1,d,12,0,0); // Mittags-Check, Transition-Stunde selbst ist für Erinnerungen irrelevant
-  return (t >= start && t < end) ? 2 : 1;
-}
-// Wandelt lokale Berlin-Zeit in einen absoluten UTC-ICS-Zeitstempel (...Z) um
-function berlinToUtcStamp(y,m,d,hh,mm){
-  const offset = berlinOffsetHours(y,m,d);
-  const dt = new Date(Date.UTC(y, m-1, d, hh - offset, mm, 0));
-  return dt.toISOString().replace(/[-:]/g,'').split('.')[0] + 'Z';
-}
-
 function buildIcs(events, opts, labels, heliosSet){
   const now = new Date();
   const dtstamp = now.toISOString().replace(/[-:]/g,'').split('.')[0] + 'Z';
@@ -583,7 +624,6 @@ function buildIcs(events, opts, labels, heliosSet){
   lines.push('VERSION:2.0');
   lines.push('PRODID:-//ATOSS Dienstplan Konverter//DE');
   lines.push('CALSCALE:GREGORIAN');
-  lines.push('METHOD:PUBLISH');
   lines.push('BEGIN:VTIMEZONE');
   lines.push('TZID:Europe/Berlin');
   lines.push('BEGIN:DAYLIGHT');
@@ -604,19 +644,36 @@ function buildIcs(events, opts, labels, heliosSet){
 
   for(const ev of events){
     const isHelios = ev.kind === 'oncall' && heliosSet.has(ev.id);
-    const label = ev.kind === 'arbeit' ? (labels[ev.code] || ev.code) : (ev.code + (isHelios ? ' + Helios' : ''));
+    let label;
+    if(ev.kind === 'arbeit') label = labels[ev.code] || ev.code;
+    else if(ev.kind === 'urlaub') label = 'U';
+    else label = ev.code + (isHelios ? ' + Helios' : '');
     const title = (opts.prefix ? opts.prefix + ' ' : '') + label;
-    const desc = ev.kind === 'arbeit' ? `Arbeitsplatz: ${ev.code}` : `Rufdienst ${ev.code}${isHelios ? ' (zusätzlich Helios)' : ''}`;
+    let desc;
+    if(ev.kind === 'arbeit') desc = `Arbeitsplatz: ${ev.code}`;
+    else if(ev.kind === 'urlaub') desc = 'Urlaub';
+    else desc = `Rufdienst ${ev.code}${isHelios ? ' (zusätzlich Helios)' : ''}`;
+    desc += ' Dienstplan';
     const uid = `${ev.id}@dienstplan-import`.replace(/\s+/g,'_');
-
-    const [sd, sm, sy] = ev.startDate.split('.');
-    const [ed, em, ey] = ev.endDate.split('.');
 
     lines.push('BEGIN:VEVENT');
     lines.push(foldLine('UID:' + uid));
     lines.push('DTSTAMP:' + dtstamp);
-    lines.push(`DTSTART;TZID=Europe/Berlin:${sy}${sm}${sd}T${ev.startTime.replace(':','')}00`);
-    lines.push(`DTEND;TZID=Europe/Berlin:${ey}${em}${ed}T${ev.endTime.replace(':','')}00`);
+
+    if(ev.kind === 'urlaub'){
+      // Ganztägiger Mehrtages-Termin: DTSTART = erster Urlaubstag, DTEND = Tag NACH
+      // dem letzten Urlaubstag (ICS-Konvention: Enddatum bei VALUE=DATE ist exklusiv).
+      const {y,m,d} = parseDate(ev.startDate);
+      const {y:ey,m:em,d:ed} = parseDate(ev.endDate);
+      const endExclusive = addDays(ey,em,ed,1);
+      lines.push(`DTSTART;VALUE=DATE:${y}${pad(m)}${pad(d)}`);
+      lines.push(`DTEND;VALUE=DATE:${endExclusive.y}${pad(endExclusive.m)}${pad(endExclusive.d)}`);
+    } else {
+      const [sd, sm, sy] = ev.startDate.split('.');
+      const [ed, em, ey] = ev.endDate.split('.');
+      lines.push(`DTSTART;TZID=Europe/Berlin:${sy}${sm}${sd}T${ev.startTime.replace(':','')}00`);
+      lines.push(`DTEND;TZID=Europe/Berlin:${ey}${em}${ed}T${ev.endTime.replace(':','')}00`);
+    }
 
     if(ev.kind === 'arbeit' && opts.reminderArbeit > 0){
       lines.push('BEGIN:VALARM');
@@ -626,16 +683,12 @@ function buildIcs(events, opts, labels, heliosSet){
       lines.push('END:VALARM');
     }
     if(ev.kind === 'oncall' && opts.oncallReminderEnabled){
-      // Erinnerung am Vorabend: Kalendertag vor Dienstbeginn, feste Uhrzeit (Europe/Berlin),
-      // unabhängig davon, ob der Dienst selbst um 16:25 oder 08:00 beginnt.
-      const {y,m,d} = parseDate(ev.startDate);
-      const prev = addDays(y,m,d,-1);
-      const [hh,mm] = opts.oncallReminderTime.split(':').map(Number);
-      const triggerStamp = berlinToUtcStamp(prev.y, prev.m, prev.d, hh, mm);
+      // Pauschal 24 Std. vor Dienstbeginn - "-P1D" ist der native ICS-Standardwert
+      // für "1 Tag vorher", den auch Apple/Google/Outlook intern für diese Option nutzen.
       lines.push('BEGIN:VALARM');
       lines.push('ACTION:DISPLAY');
-      lines.push('DESCRIPTION:Rufdienst ab morgen');
-      lines.push(`TRIGGER;VALUE=DATE-TIME:${triggerStamp}`);
+      lines.push('DESCRIPTION:Rufdienst in 24 Stunden');
+      lines.push('TRIGGER:-P1D');
       lines.push('END:VALARM');
     }
 
@@ -645,7 +698,7 @@ function buildIcs(events, opts, labels, heliosSet){
   }
 
   lines.push('END:VCALENDAR');
-  return lines.join('\r\n') + '\r\n';
+  return lines.join('\r\n');
 }
 
 function showError(msg){
